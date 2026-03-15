@@ -1,5 +1,5 @@
 # SCAV-Game-Installer
-SCAV is a basic game installer.
+SCAV is a basic game installer to make certain situations easier.
 It gets the file from your coputer and installs them.
 You select the game file and the fix file if you have one and it installs to the selected location.
 I will not update this except game crashing blasting like bugs.
