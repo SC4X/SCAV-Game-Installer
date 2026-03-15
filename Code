@@ -1,0 +1,371 @@
+import os
+import subprocess
+import re
+from tkinter import filedialog, messagebox, simpledialog
+import ttkbootstrap as ttk
+from ttkbootstrap.style import Style
+import configparser
+import shutil
+import threading
+
+# shortcut
+import pythoncom
+import win32com.client
+
+# 7-Zip and password
+sevenzip = r"C:\Program Files\7-Zip\7z.exe"
+password = "online-fix.me"  # default
+
+game_rar = ""
+fix_rar = ""
+output_folder = ""
+folder_selected = None
+extracting = False  # extraction in progress
+
+# config.ini
+appdata = os.getenv("LOCALAPPDATA")
+app_folder = os.path.join(appdata, "SCAV")
+os.makedirs(app_folder, exist_ok=True)
+config_file = os.path.join(app_folder, "config.ini")
+
+config = configparser.ConfigParser()
+if os.path.exists(config_file):
+    config.read(config_file)
+    output_folder = config.get("Settings", "last_output", fallback="")
+    password = config.get("Settings", "password", fallback=password)  # read password
+
+# Password list
+saved_passwords = []
+if "Passwords" in config:
+    saved_passwords = list(config["Passwords"].values())
+    if password not in saved_passwords:
+        saved_passwords.append(password)
+# Limit max 5 passwords
+saved_passwords = saved_passwords[-5:]
+
+# functions
+def choose_game_rar():
+    global game_rar
+    if extracting:
+        return
+    game_rar = filedialog.askopenfilename(filetypes=[("RAR/ZIP", "*.rar *.zip")])
+    if game_rar:
+        game_label.config(text=os.path.basename(game_rar))
+        folder_button.config(state="disabled")
+
+def choose_game_folder():
+    global folder_selected, game_rar
+    if extracting:
+        return
+    folder_selected = filedialog.askdirectory()
+    if folder_selected:
+        folder_label.config(text=folder_selected)
+        game_rar_button.config(state="disabled")
+        game_rar = ""
+
+def choose_fix_rar():
+    global fix_rar
+    if extracting:
+        return
+    if not folder_selected and not game_rar:
+        messagebox.showwarning("Warning", "Select game folder or RAR/ZIP first!")
+        return
+    fix_rar = filedialog.askopenfilename(filetypes=[("RAR/ZIP", "*.rar *.zip")])
+    if fix_rar:
+        fix_label.config(text=os.path.basename(fix_rar))
+
+def choose_output_folder():
+    global output_folder
+    folder = filedialog.askdirectory()
+    if not folder:
+        return
+    output_folder = folder
+    output_label.config(text=output_folder)
+    if "Settings" not in config:
+        config["Settings"] = {}
+    config["Settings"]["last_output"] = output_folder
+    with open(config_file, "w") as f:
+        config.write(f)
+
+def add_new_password():
+    global password, saved_passwords
+    new_pass = simpledialog.askstring("New Password", "Enter new password:")
+    if new_pass:
+        password = new_pass
+        if new_pass not in saved_passwords:
+            saved_passwords.append(new_pass)
+            while len(saved_passwords) > 5:
+                oldest = saved_passwords.pop(0)
+                if "Passwords" in config:
+                    for key, val in list(config["Passwords"].items()):
+                        if val == oldest:
+                            config["Passwords"].pop(key)
+                            break
+            if "Passwords" not in config:
+                config["Passwords"] = {}
+            for i, val in enumerate(saved_passwords, 1):
+                config["Passwords"][f"password{i}"] = val
+            with open(config_file, "w") as f:
+                config.write(f)
+        password_combo['values'] = saved_passwords
+        password_combo.set(password)
+        messagebox.showinfo("Success", "Password saved.")
+
+def reset_default_password():
+    global password, saved_passwords, output_folder
+    password = "online-fix.me"
+    saved_passwords = [password]
+
+    config["Passwords"] = {"password1": password}
+
+    if "Settings" in config and "last_output" in config["Settings"]:
+        config["Settings"].pop("last_output")
+    output_folder = ""
+    output_label.config(text="")
+
+    with open(config_file, "w") as f:
+        config.write(f)
+
+    password_combo['values'] = saved_passwords
+    password_combo.set(password)
+
+    messagebox.showinfo("Info", "Default password restored, other passwords and output folder cleared.")
+
+def password_selected(event=None):
+    global password
+    sel = password_combo.get()
+    if sel:
+        password = sel
+
+def reset_selection():
+    global game_rar, fix_rar, folder_selected
+    if extracting:
+        return
+    game_rar = ""
+    fix_rar = ""
+    folder_selected = None
+    game_label.config(text="")
+    fix_label.config(text="")
+    folder_label.config(text="")
+    game_rar_button.config(state="normal")
+    folder_button.config(state="normal")
+
+def get_game_name():
+    if folder_selected:
+        return os.path.basename(folder_selected)
+    cmd = [sevenzip, "l", game_rar]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 6:
+            name = parts[-1]
+            if "/" in name or "\\" in name:
+                return name.split("/")[0].split("\\")[0]
+    return os.path.splitext(os.path.basename(game_rar))[0]
+
+def extract_with_progress(rar, destination):
+    global extracting, password
+
+    while True:
+        cmd = [
+            sevenzip,
+            "x",
+            rar,
+            f"-o{destination}",
+            f"-p{password}",
+            "-aoa",
+            "-bsp1",
+            "-mmt=on"
+        ]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        wrong_password = False
+        for line in process.stdout:
+            if "Wrong password" in line or "Can not open encrypted archive" in line:
+                wrong_password = True
+            match = re.search(r"(\d+)%", line)
+            if match:
+                progress["value"] = int(match.group(1))
+                app.update()
+        process.wait()
+
+        if wrong_password:
+            new_pass = simpledialog.askstring("Wrong Password", "Incorrect password, try again:", show="*")
+            if new_pass:
+                password = new_pass
+                if new_pass not in saved_passwords:
+                    saved_passwords.append(new_pass)
+                    while len(saved_passwords) > 5:
+                        saved_passwords.pop(0)
+                    if "Passwords" not in config:
+                        config["Passwords"] = {}
+                    for i, val in enumerate(saved_passwords, 1):
+                        config["Passwords"][f"password{i}"] = val
+                    with open(config_file, "w") as f:
+                        config.write(f)
+                    password_combo['values'] = saved_passwords
+                    password_combo.set(password)
+                continue
+            else:
+                raise Exception("Password not entered, process canceled.")
+        break
+
+def create_shortcut(exe_path):
+    desktop = os.path.join(os.path.join(os.environ['USERPROFILE']), 'Desktop')
+    shortcut_path = os.path.join(desktop, os.path.basename(exe_path).replace(".exe", ".lnk"))
+    pythoncom.CoInitialize()
+    shell = win32com.client.Dispatch("WScript.Shell")
+    shortcut = shell.CreateShortCut(shortcut_path)
+    shortcut.Targetpath = exe_path
+    shortcut.WorkingDirectory = os.path.dirname(exe_path)
+    shortcut.IconLocation = exe_path
+    shortcut.save()
+
+def start_extract_thread():
+    t = threading.Thread(target=start_extract)
+    t.start()
+
+def start_extract():
+    global fix_rar, game_rar, folder_selected, extracting
+    extracting = True
+    reset_button.config(state="disabled")
+    start_button.config(state="disabled")
+    try:
+        if not output_folder:
+            messagebox.showerror("Error", "Output folder must be selected")
+            return
+
+        if not folder_selected and not fix_rar:
+            result = messagebox.askyesno("Confirmation", "Fix RAR not selected. Continue anyway?")
+            if not result:
+                return
+
+        game_name = get_game_name()
+        final_folder = os.path.join(output_folder, game_name)
+        os.makedirs(final_folder, exist_ok=True)
+
+        if folder_selected:
+            try:
+                shutil.copytree(folder_selected, final_folder, dirs_exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not copy folder:\n{e}")
+                return
+            if fix_rar:
+                status_label.config(text="Applying fix...")
+                progress["value"] = 0
+                extract_with_progress(fix_rar, final_folder)
+        else:
+            if not game_rar:
+                messagebox.showerror("Error", "Game RAR or ZIP must be selected")
+                return
+            status_label.config(text="Extracting game...")
+            progress["value"] = 0
+            extract_with_progress(game_rar, final_folder)
+            if fix_rar:
+                status_label.config(text="Applying fix...")
+                progress["value"] = 0
+                extract_with_progress(fix_rar, final_folder)
+
+        exe_files = [os.path.join(final_folder, f) for f in os.listdir(final_folder) if f.lower().endswith(".exe")]
+        if not exe_files:
+            messagebox.showinfo("Finished", f"Game ready:\n{final_folder}\n(No EXE found, shortcut not created)")
+        else:
+            exe_file = None
+            if len(exe_files) > 1:
+                exe_file = filedialog.askopenfilename(
+                    title="Select EXE for shortcut",
+                    initialdir=final_folder,
+                    filetypes=[("EXE files", "*.exe")]
+                )
+                if not exe_file:
+                    messagebox.showinfo("Canceled", "Shortcut not created")
+                    exe_file = None
+            else:
+                exe_file = exe_files[0]
+
+            if exe_file:
+                create_shortcut(exe_file)
+                messagebox.showinfo("Finished", f"Game ready and desktop shortcut created:\n{exe_file}")
+
+        status_label.config(text="Done")
+        progress["value"] = 0
+    finally:
+        extracting = False
+        reset_button.config(state="normal")
+        start_button.config(state="normal")
+
+# window
+app = ttk.Window(themename="cyborg")
+app.title("SCAV")
+app.geometry("500x580")
+app.resizable(False, False)
+
+# button style
+style = Style()
+style.configure(
+    "Purple.TButton",
+    foreground="white",
+    background="#8a2be2",
+    borderwidth=0,
+    font=("Segoe UI", 11, "bold")
+)
+style.map(
+    "Purple.TButton",
+    background=[("active", "#9d4edd")]
+)
+
+# main frame
+frame = ttk.Frame(app, padding=10)
+frame.pack(fill="both", expand=True)
+
+# Folder select
+folder_button = ttk.Button(frame, text="Select Game Folder", command=choose_game_folder, style="Purple.TButton")
+folder_button.pack(pady=3, fill="x")
+folder_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+folder_label.pack()
+
+# Game RAR select
+game_rar_button = ttk.Button(frame, text="Select Game RAR/ZIP", command=choose_game_rar, style="Purple.TButton")
+game_rar_button.pack(pady=3, fill="x")
+game_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+game_label.pack()
+
+# Fix RAR select
+ttk.Button(frame, text="Select Fix RAR/ZIP", command=choose_fix_rar, style="Purple.TButton").pack(pady=3, fill="x")
+fix_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+fix_label.pack()
+
+# Output folder
+ttk.Button(frame, text="Select Output Folder", command=choose_output_folder, style="Purple.TButton").pack(pady=3, fill="x")
+output_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+output_label.pack()
+if output_folder:
+    output_label.config(text=output_folder)
+
+# Password combobox
+password_label = ttk.Label(frame, text="Select password or add new:", font=("Segoe UI", 9))
+password_label.pack(pady=(10,0))
+password_combo = ttk.Combobox(frame, values=saved_passwords)
+password_combo.pack(fill="x", pady=3)
+password_combo.set(password)
+password_combo.bind("<<ComboboxSelected>>", password_selected)
+
+ttk.Button(frame, text="Add New Password", command=add_new_password, style="Purple.TButton").pack(pady=5, fill="x")
+ttk.Button(frame, text="Reset to Default Password", command=reset_default_password, style="Purple.TButton").pack(pady=5, fill="x")
+
+# progress bar
+progress = ttk.Progressbar(frame, bootstyle="success", mode="determinate")
+progress.pack(pady=10, fill="x")
+
+# start button
+start_button = ttk.Button(frame, text="▶ START", command=start_extract_thread, style="Purple.TButton")
+start_button.pack(pady=10, fill="x")
+
+# reset button
+reset_button = ttk.Button(frame, text="Reset Selection", command=reset_selection, style="Purple.TButton")
+reset_button.pack(pady=5, fill="x")
+
+# status label
+status_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+status_label.pack()
+
+app.mainloop()
